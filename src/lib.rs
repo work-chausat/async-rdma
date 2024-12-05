@@ -198,6 +198,8 @@ use rmr_manager::DEFAULT_RMR_TIMEOUT;
 #[cfg(feature = "cm")]
 use std::ptr::null_mut;
 use std::{alloc::Layout, fmt::Debug, io, sync::Arc, time::Duration};
+use std::net::SocketAddr;
+use std::task::{ready, Poll};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, ToSocketAddrs},
@@ -4108,6 +4110,11 @@ impl RdmaListener {
         Ok(Self { tcp_listener })
     }
 
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.tcp_listener.local_addr()
+    }
+
+
     /// Wait for a connection from a remote host
     /// # Examples
     /// ```
@@ -4193,6 +4200,55 @@ impl RdmaListener {
 
         debug!("handshake done");
         rdma.init_agent(max_message_length, *DEFAULT_ACCESS).await?;
+        Ok(rdma)
+    }
+
+    pub fn poll_accept(&self, cx: &mut std::task::Context<'_>) -> Poll<io::Result<Rdma>> {
+        let (mut stream, _) = ready!(self.tcp_listener.poll_accept(cx))?;
+
+        let mut rdma = RdmaBuilder::default()
+            .set_port_num(1)
+            .set_gid_index(1)
+            .build()?;
+        assert!(
+            rdma.conn_type == ConnectionType::RCSocket,
+            "should set connection type to RCSocket"
+        );
+        let endpoint_size = bincode::serialized_size(&rdma.endpoint()).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("Endpoint serialization failed, {:?}", e),
+            )
+        })?;
+        let mut remote = vec![0_u8; endpoint_size.cast()];
+        // the byte number is not important, as read_exact will fill the buffer
+        let _ = stream.read_exact(remote.as_mut()).await?;
+        let remote: QueuePairEndpoint = bincode::deserialize(&remote).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to deserialize remote endpoint, {:?}", e),
+            )
+        })?;
+        let local = bincode::serialize(&rdma.endpoint()).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to deserialize remote endpoint, {:?}", e),
+            )
+        })?;
+        stream.write_all(&local).await?;
+
+        let mut recv_attr = RQAttrBuilder::default();
+        let send_attr = SQAttrBuilder::default();
+        let _ = recv_attr
+            .address_handler()
+            .port_num(1)
+            .grh()
+            .sgid_index(1);
+        let (recv_attr, send_attr) = builders_into_attrs(recv_attr, send_attr, &remote)?;
+        rdma.qp_handshake(recv_attr, send_attr)?;
+
+        debug!("handshake done");
+        rdma.init_agent(usize::MAX, *DEFAULT_ACCESS).await?;
         Ok(rdma)
     }
 }

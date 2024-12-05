@@ -12,4 +12,5 @@ Cargo.lock
 /.vscode/
 
 /.cargo/
-/.github/
+/.github
+/.idea
